@@ -13,10 +13,39 @@ import (
 	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/GMWalletApp/epusdt/util/log"
+	epmath "github.com/GMWalletApp/epusdt/util/math"
 	"github.com/labstack/echo/v4"
 )
 
 const EPayTypeContextKey = "epay_type"
+
+// canResumeEPayCheckout reports whether a repeated EPay submit.php request may
+// reopen the checkout of an existing order instead of failing with 10002.
+// Only the same merchant's still-payable EPay parent order qualifies, and the
+// request must describe the same payment: a changed amount, currency, callback,
+// return URL or channel keeps the conflict rather than showing a stale target.
+// Token and network are not compared because the payer may have selected or
+// switched them on the checkout after the order was created.
+func canResumeEPayCheckout(order *mdb.Orders, apiKey *mdb.ApiKey, req *request.CreateTransactionRequest) bool {
+	if order == nil || order.ID == 0 || apiKey == nil || apiKey.ID == 0 || req == nil {
+		return false
+	}
+	if order.ApiKeyID != apiKey.ID || order.ParentTradeId != "" ||
+		!strings.EqualFold(order.PaymentType, mdb.PaymentTypeEpay) {
+		return false
+	}
+	if order.Status != mdb.StatusWaitPay && order.Status != mdb.StatusWaitSelect {
+		return false
+	}
+	precision := data.GetAmountPrecision()
+	if epmath.MustParsePrecFloat64(order.Amount, precision) != epmath.MustParsePrecFloat64(req.Amount, precision) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(order.Currency), strings.TrimSpace(req.Currency)) &&
+		strings.TrimSpace(order.NotifyUrl) == strings.TrimSpace(req.NotifyUrl) &&
+		strings.TrimSpace(order.RedirectUrl) == strings.TrimSpace(req.RedirectUrl) &&
+		strings.TrimSpace(order.EpayType) == strings.TrimSpace(req.EpayType)
+}
 
 // apiKeyFromContext returns the api_keys row stamped by CheckApiSign.
 // Returns nil when the middleware didn't run (should not happen on authed routes).
@@ -158,7 +187,7 @@ func (c *BaseCommController) CreateTransactionAndRedirect(ctx echo.Context) (err
 				log.Sugar.Errorf("get existing epay order error: %v", findErr)
 				return c.FailJson(ctx, findErr)
 			}
-			if existingOrder.ID > 0 && apiKey != nil && existingOrder.ApiKeyID == apiKey.ID && strings.EqualFold(existingOrder.PaymentType, mdb.PaymentTypeEpay) {
+			if canResumeEPayCheckout(existingOrder, apiKey, req) {
 				return ctx.Redirect(http.StatusFound, "/pay/checkout-counter/"+existingOrder.TradeId)
 			}
 		}
